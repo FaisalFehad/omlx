@@ -2039,3 +2039,42 @@ class TestVlmMtpImportGuard:
 
         assert sched.VLMMTPDrafter is not None  # falls back to typing.Any
         assert sched.run_vlm_mtp_decode is None  # falls back to None
+
+
+class TestBoundarySnapshotSkip:
+    """Tests for _detect_boundary_snapshot_need skip optimization."""
+
+    def test_skips_detection_when_ssd_disabled(self, mock_model, mock_tokenizer):
+        """When paged_ssd_cache_dir is not set, detection short-circuits."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_ssd_cache_dir=None),
+        )
+        assert scheduler._boundary_snapshot_required is False
+        # Calling again should not re-evaluate
+        assert scheduler._detect_boundary_snapshot_need() is False
+
+    def test_runs_detection_when_ssd_enabled(self, mock_model, mock_tokenizer):
+        """When paged_ssd_cache_dir is set, detection is not short-circuited."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_ssd_cache_dir="/tmp/test_ssd"),
+        )
+        # Detection is not pre-computed on init; it evaluates lazily.
+        assert scheduler._boundary_snapshot_required is None
+        # After detection it is determined
+        scheduler._detect_boundary_snapshot_need()
+        assert scheduler._boundary_snapshot_required in (True, False)
+
+    def test_preserves_explicit_true_when_ssd_disabled(self, monkeypatch, mock_model, mock_tokenizer):
+        """If _boundary_snapshot_required was explicitly set True, don't override."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_ssd_cache_dir=None),
+        )
+        scheduler._boundary_snapshot_required = True
+        # Must not short-circuit because it was explicitly set
+        assert scheduler._detect_boundary_snapshot_need() is True

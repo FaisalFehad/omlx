@@ -48,7 +48,6 @@ except ImportError:
     from typing import Any
     VLMMTPDrafter = Any  # type: ignore[assignment, misc]
     run_vlm_mtp_decode = None  # type: ignore[assignment, misc]
-from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 
 
@@ -2165,7 +2164,19 @@ class Scheduler:
 
         Evaluated lazily by inspecting model.make_cache() output instead of
         the active batch (which no longer exists in the new API).
+
+        Optimization: Skip detection entirely when paged SSD cache is disabled
+        and boundary snapshot wasn't already explicitly set.
+        Boundary snapshots are only needed when paged_ssd_cache_dir is set.
         """
+        # Phase 1: Skip detection when paged SSD cache is disabled AND
+        # boundary snapshot wasn't already explicitly set (e.g. by tests).
+        # This avoids unnecessary model inspection when cache is disabled.
+        if not self.config.paged_ssd_cache_dir and self._boundary_snapshot_required is None:
+            self._boundary_snapshot_required = False
+            return False
+
+        # Phase 2: Use cached result when already determined
         if self._boundary_snapshot_required is not None:
             return self._boundary_snapshot_required
 
