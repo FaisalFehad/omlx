@@ -723,6 +723,9 @@ class TestMtpCompatibilityHelpers:
     def test_is_mtp_compatible_qwen3_6(self):
         assert _is_mtp_compatible({"mtp_num_hidden_layers": 1}, "qwen3_6") is True
 
+    def test_is_mtp_compatible_qwen3_next(self):
+        assert _is_mtp_compatible({"mtp_num_hidden_layers": 1}, "qwen3_next") is True
+
     def test_is_mtp_compatible_deepseek_v4(self):
         assert (
             _is_mtp_compatible({"num_nextn_predict_layers": 1}, "deepseek_v4") is True
@@ -965,3 +968,96 @@ class TestIsGreedy:
 
         batch = self._make_batch(samplers=None, fallback_sampler=None)
         assert _is_greedy(batch) is True
+
+
+class TestQwen3NextModel:
+    @pytest.fixture(autouse=True)
+    def _apply(self):
+        try:
+            from omlx.patches.mlx_lm_mtp import qwen3_next_model
+        except ImportError:
+            pytest.skip("omlx.patches.mlx_lm_mtp not importable")
+        applied = qwen3_next_model.apply()
+        if not applied:
+            pytest.skip("qwen3_next_model patch refused to apply (likely mlx_lm absent)")
+
+    def test_model_args_from_dict_preserves_mtp_layers(self):
+        from mlx_lm.models.qwen3_next import ModelArgs
+
+        args = ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_next",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 256,
+                "num_experts": 0,
+                "conv_kernel_size": 3,
+                "full_attention_interval": 2,
+                "tie_word_embeddings": True,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 32,
+                "rope_theta": 1000.0,
+                "max_position_embeddings": 128,
+                "mtp_num_hidden_layers": 1,
+            }
+        )
+        assert getattr(args, "mtp_num_hidden_layers", None) == 1
+
+    def test_model_args_default_zero_when_missing(self):
+        from mlx_lm.models.qwen3_next import ModelArgs
+
+        args = ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_next",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 256,
+                "num_experts": 0,
+                "conv_kernel_size": 3,
+                "full_attention_interval": 2,
+                "tie_word_embeddings": True,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 32,
+                "rope_theta": 1000.0,
+                "max_position_embeddings": 128,
+            }
+        )
+        assert getattr(args, "mtp_num_hidden_layers", None) == 0
+
+    def test_mtp_classes_registered_on_module(self):
+        from mlx_lm.models import qwen3_next
+
+        assert hasattr(qwen3_next, "MTPModule")
+        assert hasattr(qwen3_next, "MTPDecoderLayer")
+
+    def test_model_class_has_mtp_forward(self):
+        from mlx_lm.models.qwen3_next import Model
+
+        assert hasattr(Model, "mtp_forward")
+        assert hasattr(Model, "make_mtp_cache")
+        assert hasattr(Model, "_omlx_mtp_patched")
+
+    def test_decoder_layer_passes_n_confirmed_when_nonzero(self):
+        from mlx_lm.models.qwen3_next import Qwen3NextDecoderLayer
+
+        seen = {"n_confirmed": None}
+
+        def linear_attn_with_kwarg(h, mask=None, cache=None, n_confirmed=0):
+            seen["n_confirmed"] = n_confirmed
+            return h
+
+        fake = SimpleNamespace(
+            is_linear=True,
+            input_layernorm=lambda x: x,
+            post_attention_layernorm=lambda x: x,
+            linear_attn=linear_attn_with_kwarg,
+            mlp=lambda x: 0.0,
+        )
+        Qwen3NextDecoderLayer.__call__(fake, 0.0, mask=None, cache=None, n_confirmed=3)
+        assert seen["n_confirmed"] == 3
