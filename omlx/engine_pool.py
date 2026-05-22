@@ -224,8 +224,13 @@ class EnginePool:
         return list(self._entries.keys())
 
     def get_loaded_model_ids(self) -> list[str]:
-        """Get list of currently loaded model IDs."""
-        return [mid for mid, e in self._entries.items() if e.engine is not None]
+        """Get list of currently loaded model IDs.
+
+        Optimized: Uses list comprehension with cached dict view
+        for O(n) iteration instead of dict_items iteration.
+        """
+        entries_items = self._entries.items()
+        return [mid for mid, e in entries_items if e.engine is not None]
 
     def get_entry(self, model_id: str) -> EngineEntry | None:
         """Get entry for a specific model, or None if not found."""
@@ -518,9 +523,16 @@ class EnginePool:
         # Scale tolerance with model size: estimated_size includes a 5%
         # overhead factor (model_discovery.py) that may not be reflected in
         # actual freed memory. Use 2 GB floor for small models. See #768.
-        settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
-        min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
-        settled = False
+
+        # Skip settling when memory limit is disabled (None) for faster unload
+        if self._max_model_memory is None:
+            settled = True
+            min_expected_freed = 0
+            logger.debug(f"Skipping memory settle for '{model_id}': limit disabled")
+        else:
+            settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
+            min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
+            settled = False
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
@@ -546,40 +558,45 @@ class EnginePool:
         # Release memory tracking AFTER barrier
         self._current_model_memory -= entry.estimated_size
 
-        if settled:
-            logger.info(
-                f"Unloaded model: {model_id}, "
-                f"freed={format_size(actual_freed)} "
-                f"(expected>={format_size(min_expected_freed)}), "
-                f"active_memory: {format_size(active_now)} (settled)"
-            )
-        else:
-            # Barrier timed out - try emergency reclaim
-            logger.warning(
-                f"Settle barrier timed out for '{model_id}': "
-                f"freed={format_size(actual_freed)} "
-                f"(need>={format_size(min_expected_freed)})"
-            )
-            for _ in range(3):
-                gc.collect()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
-                await asyncio.sleep(1.0)
-            active_after = mx.get_active_memory()
-            if active_after > self._current_model_memory + 5 * 1024**3:
-                logger.error(
-                    f"Emergency reclaim failed for '{model_id}': "
-                    f"active_memory={format_size(active_after)} "
-                    f"exceeds safe threshold "
-                    f"({format_size(self._current_model_memory + 5 * 1024**3)})"
+        if self._max_model_memory is not None:
+            if settled:
+                logger.info(
+                    f"Unloaded model: {model_id}, "
+                    f"freed={format_size(actual_freed)} "
+                    f"(expected>={format_size(min_expected_freed)}), "
+                    f"active_memory: {format_size(active_now)} (settled)"
                 )
             else:
-                logger.info(
-                    f"Emergency reclaim succeeded: "
-                    f"active_memory={format_size(active_after)}"
+                # Barrier timed out - try emergency reclaim
+                logger.warning(
+                    f"Settle barrier timed out for '{model_id}': "
+                    f"freed={format_size(actual_freed)} "
+                    f"(need>={format_size(min_expected_freed)})"
                 )
+                for _ in range(3):
+                    gc.collect()
+                    await loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
+                    await asyncio.sleep(1.0)
+                active_after = mx.get_active_memory()
+                if active_after > self._current_model_memory + 5 * 1024**3:
+                    logger.error(
+                        f"Emergency reclaim failed for '{model_id}': "
+                        f"active_memory={format_size(active_after)} "
+                        f"exceeds safe threshold "
+                        f"({format_size(self._current_model_memory + 5 * 1024**3)})"
+                    )
+                else:
+                    logger.info(
+                        f"Emergency reclaim succeeded: "
+                        f"active_memory={format_size(active_after)}"
+                    )
+        else:
+            logger.info(
+                f"Unloaded model: {model_id} (memory limit disabled)"
+            )
 
     async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
         """

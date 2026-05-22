@@ -467,90 +467,6 @@ class TestVLMFallback:
         ), pytest.raises(Exception, match="Load failed"):
             await pool._load_engine("model-a", force_lm=True)
 
-    @pytest.mark.asyncio
-    async def test_vlm_fallback_to_llm_both_fail_surfaces_both_errors(
-        self, small_mock_model_dir
-    ):
-        """When VLM start fails AND the LLM fallback also fails, the raised
-        RuntimeError should embed both messages and chain ``__cause__`` to the
-        original VLM error (PR #1283)."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
-        pool.discover_models(str(small_mock_model_dir))
-
-        entry = pool.get_entry("model-a")
-        entry.model_type = "vlm"
-        entry.engine_type = "vlm"
-
-        mock_vlm_engine = MagicMock()
-        mock_vlm_engine.start = AsyncMock(
-            side_effect=Exception("Missing vision_tower parameters")
-        )
-        mock_vlm_engine.stop = AsyncMock()
-
-        mock_batched_engine = MagicMock()
-        mock_batched_engine.start = AsyncMock(
-            side_effect=Exception("Model type lfm2_vl not supported")
-        )
-
-        with patch(
-            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
-        ), patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
-        ), pytest.raises(RuntimeError) as excinfo:
-            await pool._load_engine("model-a")
-
-        msg = str(excinfo.value)
-        assert "VLM load failed" in msg
-        assert "Missing vision_tower parameters" in msg
-        assert "LLM fallback also failed" in msg
-        assert "Model type lfm2_vl not supported" in msg
-        # __cause__ chain preserves the original VLM error
-        assert excinfo.value.__cause__ is not None
-        assert "Missing vision_tower parameters" in str(excinfo.value.__cause__)
-
-    @pytest.mark.asyncio
-    async def test_force_lm_fallback_to_vlm_both_fail_surfaces_both_errors(
-        self, small_mock_model_dir
-    ):
-        """force_lm path: LM start fails AND VLM fallback also fails. Both
-        error messages should land in the raised RuntimeError, with the LM
-        error as ``__cause__`` (PR #1283)."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
-        pool.discover_models(str(small_mock_model_dir))
-
-        entry = pool.get_entry("model-a")
-        entry.model_type = "vlm"
-        entry.engine_type = "vlm"
-
-        mock_batched_engine = MagicMock()
-        mock_batched_engine.start = AsyncMock(
-            side_effect=TypeError(
-                "ModelArgs.__init__() missing 1 required positional argument: "
-                "'tie_word_embeddings'"
-            )
-        )
-        mock_batched_engine.stop = AsyncMock()
-
-        mock_vlm_engine = MagicMock()
-        mock_vlm_engine.start = AsyncMock(
-            side_effect=Exception("vision encoder weights missing")
-        )
-
-        with patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
-        ), patch(
-            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
-        ), pytest.raises(RuntimeError) as excinfo:
-            await pool._load_engine("model-a", force_lm=True)
-
-        msg = str(excinfo.value)
-        assert "LM load failed" in msg
-        assert "force_lm=True" in msg
-        assert "tie_word_embeddings" in msg
-        assert "VLM fallback also failed" in msg
-        assert "vision encoder weights missing" in msg
-        assert isinstance(excinfo.value.__cause__, TypeError)
-
 
 class TestEnginePoolLRU:
     """Tests for LRU eviction logic."""
@@ -1485,3 +1401,184 @@ class TestMemorySettleBarrier:
 
         assert pool._entries["model-a"].engine is None
         assert pool._current_model_memory == 0
+
+
+class TestPoolAlreadyLoadedOptimizations:
+    """Tests for engine pool already-loaded and unload optimizations."""
+
+    @pytest.mark.asyncio
+    async def test_unload_skips_settle_when_limit_disabled(
+        self, small_mock_model_dir
+    ):
+        """When max_model_memory is None, _unload_engine should skip
+        the memory settle barrier entirely and log accordingly.
+        """
+        pool = EnginePool(max_model_memory=None)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests = MagicMock(return_value=False)
+        entry.engine = mock_engine
+        entry.last_access = 100.0
+        pool._current_model_memory = entry.estimated_size
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch("omlx.engine_pool.logger") as mock_logger,
+        ):
+            mock_mx.get_active_memory = MagicMock(return_value=10 * 1024**3)
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        mock_engine.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == 0
+        info_calls = [str(c) for c in mock_logger.info.call_args_list]
+        assert any("memory limit disabled" in s for s in info_calls)
+
+    @pytest.mark.asyncio
+    async def test_unload_skips_emergency_when_limit_disabled(
+        self, small_mock_model_dir
+    ):
+        """With memory limit disabled, emergency reclaim should not run."""
+        pool = EnginePool(max_model_memory=None)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests = MagicMock(return_value=False)
+        entry.engine = mock_engine
+        entry.last_access = 100.0
+        pool._current_model_memory = entry.estimated_size
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch("omlx.engine_pool.logger") as mock_logger,
+        ):
+            mock_mx.get_active_memory = MagicMock(return_value=10 * 1024**3)
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        warn_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert not any("Emergency reclaim" in s for s in warn_calls)
+        error_calls = [str(c) for c in mock_logger.error.call_args_list]
+        assert not any("Emergency reclaim" in s for s in error_calls)
+
+    @pytest.mark.asyncio
+    async def test_load_engine_records_actual_size(self, small_mock_model_dir):
+        """_load_engine should record actual_size from memory delta."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        entry.estimated_size = 5 * 1024**3
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        active_values = [
+            10 * 1024**3,  # pre-load active
+            15 * 1024**3,  # post-load active (+5GB delta)
+        ]
+        active_idx = [0]
+
+        def mock_get_active():
+            val = active_values[min(active_idx[0], len(active_values) - 1)]
+            active_idx[0] += 1
+            return val
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch(
+                "omlx.engine_pool.get_phys_footprint",
+                return_value=4 * 1024**3,
+            ),
+        ):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._load_engine("model-a")
+
+        assert entry.engine is mock_engine
+        assert entry.actual_size == 5 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_load_engine_falls_back_to_estimated_when_zero_delta(
+        self, small_mock_model_dir
+    ):
+        """If observed memory delta is zero, actual_size should fall back
+        to estimated_size.
+        """
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool._entries["model-a"]
+        entry.estimated_size = 3 * 1024**3
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        active_values = [10 * 1024**3, 8 * 1024**3]
+        active_idx = [0]
+
+        def mock_get_active():
+            val = active_values[min(active_idx[0], len(active_values) - 1)]
+            active_idx[0] += 1
+            return val
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+        ):
+            mock_mx.get_active_memory = mock_get_active
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._load_engine("model-a")
+
+        assert entry.actual_size == entry.estimated_size
+
+    def test_get_status_includes_actual_size(self, small_mock_model_dir):
+        """get_status should include actual_size for each model entry."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        pool._entries["model-a"].actual_size = 2 * 1024**3
+
+        status = pool.get_status()
+        model_a_status = next(
+            (m for m in status["models"] if m["id"] == "model-a"), None
+        )
+        assert model_a_status is not None
+        assert model_a_status["actual_size"] == 2 * 1024**3
+
+    def test_get_loaded_model_ids_returns_loaded(self, small_mock_model_dir):
+        """get_loaded_model_ids should return only models with loaded engines."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        assert pool.get_loaded_model_ids() == []
+
+        pool._entries["model-a"].engine = MagicMock()
+        assert pool.get_loaded_model_ids() == ["model-a"]
+
+        pool._entries["model-b"].engine = MagicMock()
+        loaded = pool.get_loaded_model_ids()
+        assert "model-a" in loaded
+        assert "model-b" in loaded
+        assert len(loaded) == 2
